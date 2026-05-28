@@ -251,3 +251,43 @@ def convert_one(src: Path, opts: ConvertOptions) -> ConvertResult:
         new_bytes = 0
 
     return ConvertResult(src, out_path, original_bytes, new_bytes, "done")
+
+
+def estimate_one(src: Path, opts: ConvertOptions) -> Optional[int]:
+    """Best-effort estimate of the output byte count for `src`.
+
+    Runs the same encode pipeline as `convert_one` but discards the result
+    instead of writing it. Returns None on any failure (unsupported,
+    corrupt, etc.) so the caller can degrade gracefully.
+    """
+    src = Path(src)
+    if not is_supported(src):
+        return None
+    out_format = opts.out_format.upper()
+    if out_format not in FORMAT_TO_EXT:
+        return None
+    try:
+        with Image.open(src) as raw:
+            raw.load()
+            img = _prepare_image(raw, out_format, opts.flatten_bg)
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+    if opts.max_dimension and opts.max_dimension > 0:
+        img = _resize(img, int(opts.max_dimension))
+
+    try:
+        if (
+            opts.target_kb
+            and opts.target_kb > 0
+            and out_format in LOSSY_FORMATS
+            and not (out_format == "WEBP" and opts.webp_lossless)
+        ):
+            target_bytes = int(opts.target_kb) * 1024
+            _, data = _binary_search_quality(
+                img, out_format, target_bytes, opts.quality, opts
+            )
+            return len(data)
+        return len(_save_to_bytes(img, out_format, opts.quality, opts))
+    except (OSError, ValueError):
+        return None

@@ -27,6 +27,7 @@ from .converter import (
     ConvertResult,
     LOSSY_FORMATS,
     convert_one,
+    estimate_one,
     human_size,
     is_supported,
 )
@@ -50,16 +51,28 @@ CARD_PAD_Y = 16
 
 DEFAULT_OUTPUT_HINT = "(default: 'converted' next to each file)"
 
+FORMAT_HINTS = {
+    "JPG": "Best for photographs. Small files, lossy. No transparency.",
+    "PNG": "Best for logos, screenshots, and images with transparency. Lossless, larger files.",
+    "WEBP": "Modern format. Smaller than JPG/PNG at similar quality. Supports transparency. Great for the web.",
+    "BMP": "Uncompressed bitmap. Very large files. Use only when a specific tool or system requires BMP.",
+    "TIFF": "Professional editing, print, and archival. Lossless with rich metadata support.",
+    "GIF": "Limited to 256 colours. Best for simple graphics or animations. Not for photographs.",
+}
+
+ESTIMATE_DEBOUNCE_MS = 350
+
 
 class FileEntry:
-    __slots__ = ("path", "size", "format_hint", "dimensions", "_thumb_pil",
-                 "_thumb_widget_ref", "_row_frame", "_meta_label")
+    __slots__ = ("path", "size", "format_hint", "dimensions", "estimated_bytes",
+                 "_thumb_pil", "_thumb_widget_ref", "_row_frame", "_meta_label")
 
     def __init__(self, path: Path, size: int, fmt: str):
         self.path = path
         self.size = size
         self.format_hint = fmt
         self.dimensions: Optional[tuple[int, int]] = None
+        self.estimated_bytes: Optional[int] = None  # None=unknown/pending
         self._thumb_pil: Optional[Image.Image] = None  # None=pending, False=failed
         self._thumb_widget_ref: Any = None
         self._row_frame: Any = None
@@ -100,6 +113,12 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self._thumb_thread: Optional[threading.Thread] = None
         self._placeholder_pil = _make_placeholder_thumb(THUMB_PX)
         self._ctk_image_cache: dict[int, Any] = {}  # entry id -> CTkImage
+
+        # Size-estimation worker
+        self._estimation_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._estimation_thread: Optional[threading.Thread] = None
+        self._estimation_generation = 0
+        self._estimation_timer: Optional[str] = None
 
         self._build_layout()
         self._restore_settings_to_widgets()
@@ -252,53 +271,71 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self.quality_slider = ctk.CTkSlider(
             slider_wrap, from_=1, to=100, number_of_steps=99,
             variable=self.quality_var,
-            command=lambda *_: self._update_quality_label(),
+            command=lambda *_: self._on_settings_changed(),
         )
         self.quality_slider.grid(row=0, column=0, sticky="ew")
         self.quality_value_label = ctk.CTkLabel(slider_wrap, text="85", width=32)
         self.quality_value_label.grid(row=0, column=1, padx=(10, 0))
 
-        # Row 2: resize
+        # Row 2: format use-case hint (spans all columns, wraps if needed)
+        self.format_hint_label = ctk.CTkLabel(
+            body, text="", anchor="w", justify="left",
+            wraplength=720,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray60"),
+        )
+        self.format_hint_label.grid(row=2, column=0, columnspan=4,
+                                    sticky="ew", pady=(0, 16))
+
+        # Row 3: resize
         self.resize_on = tk.BooleanVar(value=False)
         self.resize_check = ctk.CTkCheckBox(
             body, text="Resize: max longest side", variable=self.resize_on,
             command=self._on_toggle_resize,
         )
-        self.resize_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+        self.resize_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
 
         resize_row = ctk.CTkFrame(body, fg_color="transparent")
-        resize_row.grid(row=2, column=2, columnspan=2, sticky="w", pady=4)
+        resize_row.grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
         self.resize_entry = ctk.CTkEntry(resize_row, width=90)
         self.resize_entry.insert(0, "1920")
         self.resize_entry.grid(row=0, column=0)
+        self.resize_entry.bind("<KeyRelease>", self._on_settings_changed)
         ctk.CTkLabel(resize_row, text="px").grid(row=0, column=1, padx=(6, 0))
         self.resize_entry.configure(state="disabled")
 
-        # Row 3: target size
+        # Row 4: target size
         self.target_on = tk.BooleanVar(value=False)
         self.target_check = ctk.CTkCheckBox(
             body, text="Target file size", variable=self.target_on,
             command=self._on_toggle_target,
         )
-        self.target_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+        self.target_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
 
         target_row = ctk.CTkFrame(body, fg_color="transparent")
-        target_row.grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
+        target_row.grid(row=4, column=2, columnspan=2, sticky="w", pady=4)
         self.target_entry = ctk.CTkEntry(target_row, width=90)
         self.target_entry.insert(0, "500")
         self.target_entry.grid(row=0, column=0)
+        self.target_entry.bind("<KeyRelease>", self._on_settings_changed)
         ctk.CTkLabel(target_row, text="KB").grid(row=0, column=1, padx=(6, 0))
         self.target_entry.configure(state="disabled")
 
-        # Row 4: toggles
+        # Row 5: toggles
         toggles = ctk.CTkFrame(body, fg_color="transparent")
-        toggles.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        toggles.grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self.png_optimize_var = tk.BooleanVar(value=True)
         self.webp_lossless_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(toggles, text="PNG optimize",
-                        variable=self.png_optimize_var).grid(row=0, column=0, padx=(0, 24))
+                        variable=self.png_optimize_var,
+                        command=self._on_settings_changed).grid(
+            row=0, column=0, padx=(0, 24)
+        )
         ctk.CTkCheckBox(toggles, text="WebP lossless",
-                        variable=self.webp_lossless_var).grid(row=0, column=1)
+                        variable=self.webp_lossless_var,
+                        command=self._on_settings_changed).grid(
+            row=0, column=1
+        )
 
     def _build_output_card(self) -> None:
         card = ctk.CTkFrame(self, corner_radius=10)
@@ -436,7 +473,14 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             self.quality_slider.configure(state=state)
         except Exception:
             pass
-        self._update_quality_label()
+        self._update_format_hint(fmt)
+        self._on_settings_changed()
+
+    def _update_format_hint(self, fmt: str) -> None:
+        try:
+            self.format_hint_label.configure(text=FORMAT_HINTS.get(fmt, ""))
+        except Exception:
+            pass
 
     def _update_quality_label(self) -> None:
         try:
@@ -450,6 +494,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             self.resize_entry.configure(state=state)
         except Exception:
             pass
+        self._on_settings_changed()
 
     def _on_toggle_target(self) -> None:
         state = "normal" if self.target_on.get() else "disabled"
@@ -457,6 +502,97 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             self.target_entry.configure(state=state)
         except Exception:
             pass
+        self._on_settings_changed()
+
+    # ----- Settings change pipeline + estimation -----
+    def _on_settings_changed(self, *_event) -> None:
+        """Triggered whenever any setting that affects output size changes.
+
+        Updates the visible quality value, invalidates any current per-file
+        estimates, and schedules a fresh estimation pass after a short
+        debounce so we don't thrash while a slider is being dragged.
+        """
+        self._update_quality_label()
+        self._estimation_generation += 1
+        gen = self._estimation_generation
+        for entry in self.files:
+            entry.estimated_bytes = None
+            if entry._meta_label is not None:
+                self._refresh_meta_label(entry)
+        if self._estimation_timer is not None:
+            try:
+                self.after_cancel(self._estimation_timer)
+            except Exception:
+                pass
+        self._estimation_timer = self.after(
+            ESTIMATE_DEBOUNCE_MS, lambda g=gen: self._kick_off_estimation(g)
+        )
+
+    def _snapshot_options_for_estimate(self) -> Optional[ConvertOptions]:
+        fmt = self.format_var.get()
+        try:
+            q = max(1, min(100, int(self.quality_var.get())))
+        except Exception:
+            q = 85
+        max_dim: Optional[int] = None
+        if self.resize_on.get():
+            try:
+                v = int(self.resize_entry.get().strip())
+                if v > 0:
+                    max_dim = v
+            except ValueError:
+                return None
+        target_kb: Optional[int] = None
+        if self.target_on.get():
+            try:
+                v = int(self.target_entry.get().strip())
+                if v > 0:
+                    target_kb = v
+            except ValueError:
+                return None
+        return ConvertOptions(
+            out_format=fmt,
+            quality=q,
+            max_dimension=max_dim,
+            target_kb=target_kb,
+            png_optimize=bool(self.png_optimize_var.get()),
+            webp_lossless=bool(self.webp_lossless_var.get()),
+        )
+
+    def _kick_off_estimation(self, gen: int) -> None:
+        self._estimation_timer = None
+        if gen != self._estimation_generation:
+            return
+        opts = self._snapshot_options_for_estimate()
+        if opts is None:
+            return  # invalid numeric input — wait for valid values
+        # Drain stale items
+        while True:
+            try:
+                self._estimation_queue.get_nowait()
+            except queue.Empty:
+                break
+        for entry in self.files:
+            self._estimation_queue.put((entry, gen, opts))
+        if not self._estimation_thread or not self._estimation_thread.is_alive():
+            self._estimation_thread = threading.Thread(
+                target=self._estimation_worker, daemon=True,
+            )
+            self._estimation_thread.start()
+
+    def _estimation_worker(self) -> None:
+        while True:
+            try:
+                entry, gen, opts = self._estimation_queue.get(timeout=0.3)
+            except queue.Empty:
+                return
+            if gen != self._estimation_generation:
+                continue
+            try:
+                est = estimate_one(entry.path, opts)
+            except Exception:
+                est = None
+            self._msg_queue.put(("estimate", id(entry), gen, est))
 
     def _on_add_files(self) -> None:
         types = [
@@ -546,6 +682,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self._render_list()
         if added:
             self._enqueue_thumbs(added)
+            self._enqueue_estimates(added)
         if added or skipped:
             parts = []
             if added:
@@ -586,17 +723,14 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=0, column=1, sticky="ew", pady=(10, 0))
 
-        meta = f"{human_size(entry.size)}  •  {entry.format_hint}"
-        if entry.dimensions:
-            w, h = entry.dimensions
-            meta += f"  •  {w} × {h}"
         meta_label = ctk.CTkLabel(
-            row, text=meta, anchor="w",
+            row, text="", anchor="w",
             text_color=("gray45", "gray65"),
             font=ctk.CTkFont(size=11),
         )
         meta_label.grid(row=1, column=1, sticky="ew", pady=(0, 10))
         entry._meta_label = meta_label
+        self._refresh_meta_label(entry)
 
         ctk.CTkButton(
             row, text="✕", command=lambda i=idx: self._remove_at(i),
@@ -605,6 +739,34 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             text_color=("gray35", "gray70"),
             hover_color=("gray80", "gray30"),
         ).grid(row=0, column=2, rowspan=2, padx=(8, 10), pady=10)
+
+    def _refresh_meta_label(self, entry: FileEntry) -> None:
+        if entry._meta_label is None:
+            return
+        parts = []
+        if isinstance(entry.estimated_bytes, int):
+            orig = entry.size
+            est = entry.estimated_bytes
+            if orig > 0:
+                delta_pct = (orig - est) / orig * 100
+                sign = "-" if delta_pct >= 0 else "+"
+                parts.append(
+                    f"{human_size(orig)} → {human_size(est)}  "
+                    f"({sign}{abs(delta_pct):.0f}%)"
+                )
+            else:
+                parts.append(f"{human_size(orig)} → {human_size(est)}")
+        else:
+            parts.append(human_size(entry.size))
+        parts.append(entry.format_hint)
+        if entry.dimensions:
+            w, h = entry.dimensions
+            parts.append(f"{w} × {h}")
+        text = "  •  ".join(parts)
+        try:
+            entry._meta_label.configure(text=text)
+        except Exception:
+            pass
 
     def _build_ctk_image_for(self, entry: FileEntry):
         pil = entry._thumb_pil if isinstance(entry._thumb_pil, Image.Image) \
@@ -619,6 +781,19 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             entry = self.files.pop(index)
             self._ctk_image_cache.pop(id(entry), None)
             self._render_list()
+
+    def _enqueue_estimates(self, entries: list[FileEntry]) -> None:
+        opts = self._snapshot_options_for_estimate()
+        if opts is None:
+            return
+        gen = self._estimation_generation
+        for e in entries:
+            self._estimation_queue.put((e, gen, opts))
+        if not self._estimation_thread or not self._estimation_thread.is_alive():
+            self._estimation_thread = threading.Thread(
+                target=self._estimation_worker, daemon=True,
+            )
+            self._estimation_thread.start()
 
     # ----- Thumbnail worker -----
     def _enqueue_thumbs(self, entries: list[FileEntry]) -> None:
@@ -781,6 +956,14 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                     self._on_batch_done(results)
                 elif kind == "thumb":
                     self._update_thumb_for(msg[1])
+                elif kind == "estimate":
+                    _, entry_id, gen, est = msg
+                    if gen != self._estimation_generation:
+                        continue
+                    entry = next((f for f in self.files if id(f) == entry_id), None)
+                    if entry is not None:
+                        entry.estimated_bytes = est if isinstance(est, int) else None
+                        self._refresh_meta_label(entry)
         except queue.Empty:
             pass
         self.after(80, self._poll_queue)
@@ -797,14 +980,8 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             widget.configure(image=new_img)
         except Exception:
             return
-        meta_label = entry._meta_label
-        if meta_label is not None and entry.dimensions:
-            w, h = entry.dimensions
-            meta = f"{human_size(entry.size)}  •  {entry.format_hint}  •  {w} × {h}"
-            try:
-                meta_label.configure(text=meta)
-            except Exception:
-                pass
+        # Refresh the meta line so the newly-known dimensions appear
+        self._refresh_meta_label(entry)
 
     def _set_progress(self, fraction: float) -> None:
         fraction = max(0.0, min(1.0, fraction))
