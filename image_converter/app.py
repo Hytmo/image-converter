@@ -129,8 +129,9 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         if DND_AVAILABLE:
             try:
                 windnd.hook_dropfiles(self, func=self._on_drop_paths)
-            except Exception:
-                pass
+                self._log_info("windnd drag-drop hook installed")
+            except Exception as exc:
+                self._log_error("installing windnd drag-drop hook", exc)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -194,11 +195,18 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         ).grid(row=0, column=0, padx=(0, 8))
 
         ctk.CTkButton(
+            bar, text="Add folder…", command=self._on_add_folder,
+            width=130, height=36,
+            fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray80"),
+        ).grid(row=0, column=1, padx=(0, 8))
+
+        ctk.CTkButton(
             bar, text="Clear list", command=self._on_clear_list,
             width=100, height=36,
             fg_color="transparent", border_width=1,
             text_color=("gray20", "gray80"),
-        ).grid(row=0, column=1)
+        ).grid(row=0, column=2)
 
         dnd_hint = "Drag and drop images anywhere in the window" if DND_AVAILABLE \
             else "Install 'windnd' for drag-and-drop"
@@ -206,7 +214,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             bar, text=dnd_hint,
             font=ctk.CTkFont(size=12),
             text_color=("gray45", "gray60"),
-        ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+        ).grid(row=0, column=3, sticky="e", padx=(8, 0))
 
     def _build_file_list(self) -> None:
         card = ctk.CTkFrame(self, corner_radius=10)
@@ -467,6 +475,39 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self._save_settings()
         self.destroy()
 
+    # ----- Logging -----
+    def _log_path(self) -> Optional[Path]:
+        try:
+            p = user_settings.settings_path().parent / "error.log"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            return None
+
+    def _log_info(self, msg: str) -> None:
+        try:
+            import datetime
+            p = self._log_path()
+            if p is None:
+                return
+            with p.open("a", encoding="utf-8") as f:
+                f.write(f"[INFO  {datetime.datetime.now().isoformat()}] {msg}\n")
+        except Exception:
+            pass
+
+    def _log_error(self, where: str, exc: BaseException) -> None:
+        try:
+            import datetime
+            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+            p = self._log_path()
+            if p is None:
+                return
+            with p.open("a", encoding="utf-8") as f:
+                f.write(f"[ERROR {datetime.datetime.now().isoformat()}] {where}\n")
+                f.write("".join(tb))
+        except Exception:
+            pass
+
     # ----- Exception handling -----
     def _on_tk_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
         """Catch-all for exceptions raised inside Tk callbacks.
@@ -638,6 +679,28 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             user_settings.save(self.settings)
             self._add_paths([Path(p) for p in paths])
 
+    def _on_add_folder(self) -> None:
+        initial = self.settings.get("last_input_folder") or ""
+        kwargs = {"title": "Choose a folder of images"}
+        if initial and Path(initial).is_dir():
+            kwargs["initialdir"] = initial
+        folder = filedialog.askdirectory(**kwargs)
+        if not folder:
+            return
+        root = Path(folder)
+        try:
+            found = [c for c in root.rglob("*") if c.is_file() and is_supported(c)]
+        except OSError as exc:
+            self._log_error(f"walking folder {root}", exc)
+            messagebox.showerror("Folder unreadable", f"Could not read {root}:\n{exc}")
+            return
+        if not found:
+            messagebox.showinfo("No images", f"No supported images found under:\n{root}")
+            return
+        self.settings["last_input_folder"] = str(root)
+        user_settings.save(self.settings)
+        self._add_paths(found)
+
     def _on_clear_list(self) -> None:
         self.files.clear()
         self._ctk_image_cache.clear()
@@ -664,21 +727,30 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         user_settings.save(self.settings)
 
     def _on_drop_paths(self, raw_paths) -> None:
-        """windnd callback. Runs INSIDE the Win32 windproc dispatch, so we
-        must not synchronously mutate widgets from here — defer to the next
-        Tk event-loop tick instead.
+        """windnd callback. Runs INSIDE Win32 WM_DROPFILES dispatch.
+
+        Doing anything Tk-touching here — including ``self.after``, which
+        goes through Tcl and can re-enter the event loop — risks
+        reentrancy crashes that kill the windowed bundle silently. So we
+        just push a snapshot of the raw drop data onto our existing
+        thread-safe queue and let the periodic poller pick it up from a
+        safe event-loop tick.
         """
         try:
-            # Copy raw input out of the windnd buffer immediately
             snapshot = list(raw_paths)
-        except Exception:
+        except Exception as exc:
+            self._log_error("snapshotting drop paths", exc)
             return
         try:
-            self.after(0, lambda r=snapshot: self._process_dropped_paths(r))
-        except Exception:
-            pass
+            self._msg_queue.put(("drop", snapshot))
+        except Exception as exc:
+            self._log_error("queueing drop paths", exc)
 
     def _process_dropped_paths(self, raw_paths) -> None:
+        try:
+            self._log_info(f"processing {len(raw_paths)} dropped path(s)")
+        except Exception:
+            pass
         paths: list[Path] = []
         try:
             for raw in raw_paths:
@@ -688,14 +760,24 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                             p = raw.decode("mbcs")
                         except UnicodeDecodeError:
                             p = raw.decode("utf-8", errors="replace")
+                    elif raw is None:
+                        continue
                     else:
                         p = str(raw)
+                    if not p:
+                        continue
                     path = Path(p)
-                except Exception:
+                except Exception as exc:
+                    self._log_error("decoding a dropped path", exc)
                     continue
                 try:
                     if path.is_dir():
-                        for child in path.rglob("*"):
+                        try:
+                            it = path.rglob("*")
+                        except OSError as exc:
+                            self._log_error(f"opening dropped folder {path}", exc)
+                            continue
+                        for child in it:
                             try:
                                 if child.is_file() and is_supported(child):
                                     paths.append(child)
@@ -703,11 +785,13 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                                 continue
                     elif path.is_file():
                         paths.append(path)
-                except OSError:
+                except OSError as exc:
+                    self._log_error(f"stat-ing dropped path {path}", exc)
                     continue
             if paths:
                 self._add_paths(paths)
         except Exception as exc:
+            self._log_error("processing drop", exc)
             try:
                 self.status_var.set(f"Drop failed: {exc}")
             except Exception:
@@ -1017,6 +1101,8 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                     self._on_batch_done(results)
                 elif kind == "thumb":
                     self._update_thumb_for(msg[1])
+                elif kind == "drop":
+                    self._process_dropped_paths(msg[1])
                 elif kind == "estimate":
                     _, entry_id, gen, est = msg
                     if gen != self._estimation_generation:
