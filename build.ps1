@@ -18,7 +18,7 @@
   .\build.ps1
 #>
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
@@ -27,6 +27,7 @@ $venvPyInstaller = Join-Path $root "venv\Scripts\pyinstaller.exe"
 
 if (-not (Test-Path $venvPyInstaller)) {
     Write-Error "PyInstaller not found in venv. Run 'pip install -r requirements.txt' first."
+    exit 1
 }
 
 # Locate Tcl/Tk script directories from the base interpreter, in case the
@@ -39,11 +40,11 @@ $tclCandidates = @(
 )
 foreach ($root2 in $tclCandidates) {
     if (-not (Test-Path $root2)) { continue }
-    $tclDir = Get-ChildItem $root2 -Directory -Filter "tcl[0-9]*" -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName "init.tcl") } |
+    $tclDir = Get-ChildItem $root2 -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^tcl\d' -and (Test-Path (Join-Path $_.FullName "init.tcl")) } |
         Select-Object -First 1
-    $tkDir = Get-ChildItem $root2 -Directory -Filter "tk[0-9]*" -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName "tk.tcl") } |
+    $tkDir = Get-ChildItem $root2 -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^tk\d' -and (Test-Path (Join-Path $_.FullName "tk.tcl")) } |
         Select-Object -First 1
     if ($tclDir -and $tkDir) {
         $env:TCL_LIBRARY = $tclDir.FullName
@@ -54,7 +55,14 @@ foreach ($root2 in $tclCandidates) {
     }
 }
 
+if (-not $env:TCL_LIBRARY) {
+    Write-Warning "Could not auto-detect Tcl/Tk library directories. PyInstaller may exclude tkinter from the build."
+}
+
 Remove-Item -Recurse -Force build, dist, ImageConverter.spec -ErrorAction SilentlyContinue
+
+$iconPath = Join-Path $root "assets\icon.ico"
+$assetsArg = "assets" + [IO.Path]::PathSeparator + "assets"
 
 & $venvPyInstaller `
     --noconfirm `
@@ -62,12 +70,15 @@ Remove-Item -Recurse -Force build, dist, ImageConverter.spec -ErrorAction Silent
     --onefile `
     --windowed `
     --name ImageConverter `
+    --icon $iconPath `
+    --add-data $assetsArg `
     --collect-all customtkinter `
     --collect-all pillow_heif `
     main.py
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "PyInstaller exited with code $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
 
 $exe = Join-Path $root "dist\ImageConverter.exe"
@@ -76,4 +87,5 @@ if (Test-Path $exe) {
     Write-Host ("Built: {0}  ({1:N1} MB)" -f $exe, ($size / 1MB))
 } else {
     Write-Error "Build finished but $exe is missing."
+    exit 1
 }

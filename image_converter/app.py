@@ -7,28 +7,30 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Optional
-
-try:
-    import customtkinter as ctk
-    USING_CTK = True
-except ImportError:
-    import tkinter as ctk  # type: ignore
-    USING_CTK = False
+from typing import Any, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+try:
+    import customtkinter as ctk
+    USING_CTK = True
+except ImportError:  # pragma: no cover
+    ctk = tk  # type: ignore
+    USING_CTK = False
+
+from PIL import Image, ImageOps
+
+from . import settings as user_settings
 from .converter import (
     ConvertOptions,
     ConvertResult,
-    FORMAT_TO_EXT,
     LOSSY_FORMATS,
-    SUPPORTED_INPUT_EXTS,
     convert_one,
     human_size,
     is_supported,
 )
+from .resources import resource_path
 
 try:
     import windnd  # type: ignore
@@ -40,39 +42,67 @@ except ImportError:
 APP_TITLE = "Image Converter"
 APP_VERSION = "1.0.0"
 FORMATS = ["JPG", "PNG", "WEBP", "BMP", "TIFF", "GIF"]
+THUMB_PX = 56
+OUTER = 22
+GUTTER = 14
+CARD_PAD_X = 20
+CARD_PAD_Y = 16
+
+DEFAULT_OUTPUT_HINT = "(default: 'converted' next to each file)"
 
 
 class FileEntry:
-    __slots__ = ("path", "size", "format_hint", "frame")
+    __slots__ = ("path", "size", "format_hint", "dimensions", "_thumb_pil",
+                 "_thumb_widget_ref", "_row_frame", "_meta_label")
 
     def __init__(self, path: Path, size: int, fmt: str):
         self.path = path
         self.size = size
         self.format_hint = fmt
-        self.frame = None
+        self.dimensions: Optional[tuple[int, int]] = None
+        self._thumb_pil: Optional[Image.Image] = None  # None=pending, False=failed
+        self._thumb_widget_ref: Any = None
+        self._row_frame: Any = None
+        self._meta_label: Any = None
 
 
 def _format_hint(path: Path) -> str:
     return path.suffix.lstrip(".").upper() or "?"
 
 
+def _make_placeholder_thumb(size: int) -> Image.Image:
+    im = Image.new("RGBA", (size, size), (235, 235, 240, 255))
+    return im
+
+
 class App(ctk.CTk if USING_CTK else tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+
         if USING_CTK:
             ctk.set_appearance_mode("system")
             ctk.set_default_color_theme("blue")
 
-        self.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.geometry("960x720")
-        self.minsize(820, 600)
+        self.title(f"{APP_TITLE}")
+        self.geometry("1020x780")
+        self.minsize(900, 660)
 
+        self._load_window_icon()
+
+        # Persistent settings
+        self.settings: dict[str, Any] = user_settings.load()
+
+        # State
         self.files: list[FileEntry] = []
         self._worker: Optional[threading.Thread] = None
         self._msg_queue: "queue.Queue[tuple]" = queue.Queue()
-        self._cancel_requested = False
+        self._thumb_queue: "queue.Queue[FileEntry]" = queue.Queue()
+        self._thumb_thread: Optional[threading.Thread] = None
+        self._placeholder_pil = _make_placeholder_thumb(THUMB_PX)
+        self._ctk_image_cache: dict[int, Any] = {}  # entry id -> CTkImage
 
         self._build_layout()
+        self._restore_settings_to_widgets()
         self._poll_queue()
 
         if DND_AVAILABLE:
@@ -81,206 +111,331 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             except Exception:
                 pass
 
-    # ----- Layout -----
-    def _build_layout(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        header = self._frame(self, padx=12, pady=(12, 6))
-        header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(2, weight=1)
-
-        self._button(header, "Add files...", self._on_add_files).grid(row=0, column=0, padx=(0, 8))
-        self._button(header, "Clear list", self._on_clear_list, kind="secondary").grid(
-            row=0, column=1, padx=(0, 8)
-        )
-
-        dnd_hint = "Drag and drop images anywhere in the window" if DND_AVAILABLE else \
-                   "Drag-and-drop unavailable (install 'windnd' to enable)"
-        self._label(header, dnd_hint, muted=True).grid(row=0, column=2, sticky="e")
-
-        # File list area
-        list_wrap = self._frame(self, padx=12, pady=6)
-        list_wrap.grid(row=1, column=0, sticky="nsew")
-        list_wrap.grid_columnconfigure(0, weight=1)
-        list_wrap.grid_rowconfigure(0, weight=1)
-
-        if USING_CTK:
-            self.list_frame = ctk.CTkScrollableFrame(list_wrap, label_text="Files")
-        else:
-            self.list_frame = tk.Frame(list_wrap, borderwidth=1, relief="solid")
-        self.list_frame.grid(row=0, column=0, sticky="nsew")
-
-        self.empty_label = self._label(
-            self.list_frame,
-            "No files yet. Click \"Add files...\" or drop images here.",
-            muted=True,
-        )
-        self.empty_label.grid(row=0, column=0, padx=20, pady=20)
-
-        # Options panel
-        opts = self._frame(self, padx=12, pady=6)
-        opts.grid(row=2, column=0, sticky="ew")
-        for c in range(4):
-            opts.grid_columnconfigure(c, weight=1, uniform="opt")
-
-        # Row 0: format + quality
-        self._label(opts, "Output format").grid(row=0, column=0, sticky="w", padx=4, pady=(6, 0))
-        self._label(opts, "Quality").grid(row=0, column=1, columnspan=2, sticky="w", padx=4, pady=(6, 0))
-
-        self.format_var = tk.StringVar(value="JPG")
-        if USING_CTK:
-            self.format_menu = ctk.CTkOptionMenu(opts, values=FORMATS, variable=self.format_var,
-                                                 command=lambda *_: self._on_format_change())
-        else:
-            self.format_menu = tk.OptionMenu(opts, self.format_var, *FORMATS,
-                                             command=lambda *_: self._on_format_change())
-        self.format_menu.grid(row=1, column=0, sticky="ew", padx=4)
-
-        self.quality_var = tk.IntVar(value=85)
-        if USING_CTK:
-            self.quality_slider = ctk.CTkSlider(
-                opts, from_=1, to=100, number_of_steps=99, variable=self.quality_var,
-                command=lambda *_: self._update_quality_label()
-            )
-        else:
-            self.quality_slider = tk.Scale(
-                opts, from_=1, to=100, orient="horizontal", variable=self.quality_var,
-                command=lambda *_: self._update_quality_label(), showvalue=False
-            )
-        self.quality_slider.grid(row=1, column=1, columnspan=2, sticky="ew", padx=4)
-        self.quality_value_label = self._label(opts, "85")
-        self.quality_value_label.grid(row=1, column=3, sticky="w", padx=4)
-
-        # Row 2: resize and target size
-        self.resize_on = tk.BooleanVar(value=False)
-        self.resize_check = self._checkbox(opts, "Resize: max longest side (px)", self.resize_on,
-                                           self._on_toggle_resize)
-        self.resize_check.grid(row=2, column=0, sticky="w", padx=4, pady=(10, 0))
-
-        self.resize_entry = self._entry(opts, default="1920", width=100)
-        self.resize_entry.grid(row=2, column=1, sticky="w", padx=4, pady=(10, 0))
-        self._set_widget_state(self.resize_entry, "disabled")
-
-        self.target_on = tk.BooleanVar(value=False)
-        self.target_check = self._checkbox(opts, "Target file size (KB)", self.target_on,
-                                           self._on_toggle_target)
-        self.target_check.grid(row=2, column=2, sticky="w", padx=4, pady=(10, 0))
-
-        self.target_entry = self._entry(opts, default="500", width=100)
-        self.target_entry.grid(row=2, column=3, sticky="w", padx=4, pady=(10, 0))
-        self._set_widget_state(self.target_entry, "disabled")
-
-        # Row 3: optimize toggles
-        self.png_optimize_var = tk.BooleanVar(value=True)
-        self.webp_lossless_var = tk.BooleanVar(value=False)
-        self._checkbox(opts, "PNG optimize", self.png_optimize_var).grid(
-            row=3, column=0, sticky="w", padx=4, pady=(10, 0)
-        )
-        self._checkbox(opts, "WebP lossless", self.webp_lossless_var).grid(
-            row=3, column=1, sticky="w", padx=4, pady=(10, 0)
-        )
-
-        # Output folder
-        out_frame = self._frame(self, padx=12, pady=6)
-        out_frame.grid(row=3, column=0, sticky="ew")
-        out_frame.grid_columnconfigure(1, weight=1)
-
-        self._label(out_frame, "Output folder").grid(row=0, column=0, padx=(4, 8), sticky="w")
-        self.output_var = tk.StringVar(value="(default: 'converted' next to each file)")
-        self.output_entry = self._entry(out_frame, default=None, textvariable=self.output_var)
-        self.output_entry.grid(row=0, column=1, sticky="ew", padx=4)
-        self._button(out_frame, "Browse...", self._on_browse_output, kind="secondary").grid(
-            row=0, column=2, padx=4
-        )
-        self._button(out_frame, "Reset", self._on_reset_output, kind="secondary").grid(
-            row=0, column=3, padx=(4, 0)
-        )
-
-        # Action + progress
-        action = self._frame(self, padx=12, pady=(6, 12))
-        action.grid(row=4, column=0, sticky="ew")
-        action.grid_columnconfigure(1, weight=1)
-
-        self.convert_btn = self._button(action, "Convert", self._on_convert)
-        self.convert_btn.grid(row=0, column=0, padx=(0, 12))
-
-        if USING_CTK:
-            self.progress = ctk.CTkProgressBar(action)
-            self.progress.set(0)
-        else:
-            from tkinter import ttk
-            self.progress = ttk.Progressbar(action, mode="determinate", maximum=100)
-        self.progress.grid(row=0, column=1, sticky="ew")
-
-        self.status_var = tk.StringVar(value="Ready.")
-        self.status_label = self._label(action, "")
-        self.status_label.configure(textvariable=self.status_var)
-        self.status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        self._on_format_change()
-
-    # ----- Helpers for widgets -----
-    def _frame(self, parent, padx=0, pady=0):
-        if USING_CTK:
-            f = ctk.CTkFrame(parent, fg_color="transparent")
-        else:
-            f = tk.Frame(parent)
-        return f
-
-    def _label(self, parent, text, muted: bool = False):
-        if USING_CTK:
-            color = ("gray50", "gray60") if muted else None
-            if color:
-                return ctk.CTkLabel(parent, text=text, text_color=color)
-            return ctk.CTkLabel(parent, text=text)
-        return tk.Label(parent, text=text, fg=("gray" if muted else "black"))
-
-    def _button(self, parent, text, command, kind="primary"):
-        if USING_CTK:
-            if kind == "secondary":
-                return ctk.CTkButton(parent, text=text, command=command,
-                                     fg_color="transparent", border_width=1)
-            return ctk.CTkButton(parent, text=text, command=command)
-        return tk.Button(parent, text=text, command=command)
-
-    def _entry(self, parent, default=None, width=None, textvariable=None):
-        if USING_CTK:
-            kwargs = {}
-            if width:
-                kwargs["width"] = width
-            if textvariable is not None:
-                kwargs["textvariable"] = textvariable
-            e = ctk.CTkEntry(parent, **kwargs)
-        else:
-            kwargs = {}
-            if width:
-                kwargs["width"] = max(8, width // 8)
-            if textvariable is not None:
-                kwargs["textvariable"] = textvariable
-            e = tk.Entry(parent, **kwargs)
-        if default is not None and textvariable is None:
-            e.insert(0, default)
-        return e
-
-    def _checkbox(self, parent, text, variable, command=None):
-        if USING_CTK:
-            return ctk.CTkCheckBox(parent, text=text, variable=variable, command=command)
-        return tk.Checkbutton(parent, text=text, variable=variable, command=command)
-
-    def _set_widget_state(self, widget, state: str) -> None:
+    # ----- Window icon -----
+    def _load_window_icon(self) -> None:
+        ico = resource_path("assets", "icon.ico")
+        png = resource_path("assets", "icon.png")
         try:
-            widget.configure(state=state)
+            if ico.exists():
+                self.iconbitmap(default=str(ico))
+                return
+        except Exception:
+            pass
+        try:
+            if png.exists():
+                photo = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, photo)
+                # Keep a reference so it isn't garbage-collected
+                self._icon_photo_ref = photo
         except Exception:
             pass
 
-    # ----- Event handlers -----
+    # ----- Layout -----
+    def _build_layout(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # file list card expands
+
+        self._build_header()
+        self._build_toolbar()
+        self._build_file_list()
+        self._build_settings_card()
+        self._build_output_card()
+        self._build_footer()
+
+    def _build_header(self) -> None:
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=OUTER, pady=(OUTER, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(
+            header, text=APP_TITLE,
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        title.grid(row=0, column=0, sticky="w")
+
+        sub = ctk.CTkLabel(
+            header, text=f"v{APP_VERSION}",
+            font=ctk.CTkFont(size=12),
+            text_color=("gray45", "gray60"),
+        )
+        sub.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+    def _build_toolbar(self) -> None:
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", padx=OUTER, pady=(0, GUTTER))
+        bar.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkButton(
+            bar, text="Add files…", command=self._on_add_files,
+            width=130, height=36,
+        ).grid(row=0, column=0, padx=(0, 8))
+
+        ctk.CTkButton(
+            bar, text="Clear list", command=self._on_clear_list,
+            width=100, height=36,
+            fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray80"),
+        ).grid(row=0, column=1)
+
+        dnd_hint = "Drag and drop images anywhere in the window" if DND_AVAILABLE \
+            else "Install 'windnd' for drag-and-drop"
+        ctk.CTkLabel(
+            bar, text=dnd_hint,
+            font=ctk.CTkFont(size=12),
+            text_color=("gray45", "gray60"),
+        ).grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+    def _build_file_list(self) -> None:
+        card = ctk.CTkFrame(self, corner_radius=10)
+        card.grid(row=2, column=0, sticky="nsew", padx=OUTER, pady=(0, GUTTER))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            card, text="Files",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=CARD_PAD_X, pady=(CARD_PAD_Y, 6))
+
+        self.list_frame = ctk.CTkScrollableFrame(
+            card, fg_color="transparent",
+        )
+        self.list_frame.grid(row=1, column=0, sticky="nsew",
+                             padx=CARD_PAD_X - 6, pady=(0, CARD_PAD_Y))
+        self.list_frame.grid_columnconfigure(0, weight=1)
+
+        self._empty_label = ctk.CTkLabel(
+            self.list_frame,
+            text="No files yet.\nClick \"Add files…\" or drop images here.",
+            text_color=("gray50", "gray60"),
+            justify="center",
+        )
+        self._empty_label.grid(row=0, column=0, padx=24, pady=40)
+
+    def _build_settings_card(self) -> None:
+        card = ctk.CTkFrame(self, corner_radius=10)
+        card.grid(row=3, column=0, sticky="ew", padx=OUTER, pady=(0, GUTTER))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card, text="Conversion settings",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=CARD_PAD_X, pady=(CARD_PAD_Y, 10))
+
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="ew",
+                  padx=CARD_PAD_X, pady=(0, CARD_PAD_Y))
+        for c in range(4):
+            body.grid_columnconfigure(c, weight=1, uniform="settings")
+
+        # Row 0: labels
+        ctk.CTkLabel(body, text="Format").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ctk.CTkLabel(body, text="Quality").grid(row=0, column=1, columnspan=3, sticky="w",
+                                                pady=(0, 4), padx=(20, 0))
+
+        # Row 1: controls
+        self.format_var = tk.StringVar(value="JPG")
+        self.format_menu = ctk.CTkOptionMenu(
+            body, values=FORMATS, variable=self.format_var,
+            command=lambda *_: self._on_format_change(),
+            width=140,
+        )
+        self.format_menu.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+
+        slider_wrap = ctk.CTkFrame(body, fg_color="transparent")
+        slider_wrap.grid(row=1, column=1, columnspan=3, sticky="ew",
+                         pady=(0, 14), padx=(20, 0))
+        slider_wrap.grid_columnconfigure(0, weight=1)
+
+        self.quality_var = tk.IntVar(value=85)
+        self.quality_slider = ctk.CTkSlider(
+            slider_wrap, from_=1, to=100, number_of_steps=99,
+            variable=self.quality_var,
+            command=lambda *_: self._update_quality_label(),
+        )
+        self.quality_slider.grid(row=0, column=0, sticky="ew")
+        self.quality_value_label = ctk.CTkLabel(slider_wrap, text="85", width=32)
+        self.quality_value_label.grid(row=0, column=1, padx=(10, 0))
+
+        # Row 2: resize
+        self.resize_on = tk.BooleanVar(value=False)
+        self.resize_check = ctk.CTkCheckBox(
+            body, text="Resize: max longest side", variable=self.resize_on,
+            command=self._on_toggle_resize,
+        )
+        self.resize_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+
+        resize_row = ctk.CTkFrame(body, fg_color="transparent")
+        resize_row.grid(row=2, column=2, columnspan=2, sticky="w", pady=4)
+        self.resize_entry = ctk.CTkEntry(resize_row, width=90)
+        self.resize_entry.insert(0, "1920")
+        self.resize_entry.grid(row=0, column=0)
+        ctk.CTkLabel(resize_row, text="px").grid(row=0, column=1, padx=(6, 0))
+        self.resize_entry.configure(state="disabled")
+
+        # Row 3: target size
+        self.target_on = tk.BooleanVar(value=False)
+        self.target_check = ctk.CTkCheckBox(
+            body, text="Target file size", variable=self.target_on,
+            command=self._on_toggle_target,
+        )
+        self.target_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        target_row = ctk.CTkFrame(body, fg_color="transparent")
+        target_row.grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
+        self.target_entry = ctk.CTkEntry(target_row, width=90)
+        self.target_entry.insert(0, "500")
+        self.target_entry.grid(row=0, column=0)
+        ctk.CTkLabel(target_row, text="KB").grid(row=0, column=1, padx=(6, 0))
+        self.target_entry.configure(state="disabled")
+
+        # Row 4: toggles
+        toggles = ctk.CTkFrame(body, fg_color="transparent")
+        toggles.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.png_optimize_var = tk.BooleanVar(value=True)
+        self.webp_lossless_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(toggles, text="PNG optimize",
+                        variable=self.png_optimize_var).grid(row=0, column=0, padx=(0, 24))
+        ctk.CTkCheckBox(toggles, text="WebP lossless",
+                        variable=self.webp_lossless_var).grid(row=0, column=1)
+
+    def _build_output_card(self) -> None:
+        card = ctk.CTkFrame(self, corner_radius=10)
+        card.grid(row=4, column=0, sticky="ew", padx=OUTER, pady=(0, GUTTER))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card, text="Output folder",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=CARD_PAD_X, pady=(CARD_PAD_Y, 8))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=1, column=0, sticky="ew",
+                 padx=CARD_PAD_X, pady=(0, CARD_PAD_Y))
+        row.grid_columnconfigure(0, weight=1)
+
+        self.output_var = tk.StringVar(value=DEFAULT_OUTPUT_HINT)
+        self.output_entry = ctk.CTkEntry(row, textvariable=self.output_var)
+        self.output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        ctk.CTkButton(
+            row, text="Browse…", command=self._on_browse_output,
+            width=110, fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray80"),
+        ).grid(row=0, column=1, padx=(0, 6))
+
+        ctk.CTkButton(
+            row, text="Reset", command=self._on_reset_output,
+            width=80, fg_color="transparent", border_width=1,
+            text_color=("gray20", "gray80"),
+        ).grid(row=0, column=2)
+
+    def _build_footer(self) -> None:
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=5, column=0, sticky="ew", padx=OUTER, pady=(0, OUTER))
+        footer.grid_columnconfigure(1, weight=1)
+
+        self.convert_btn = ctk.CTkButton(
+            footer, text="Convert", command=self._on_convert,
+            width=160, height=44,
+            font=ctk.CTkFont(size=15, weight="bold"),
+        )
+        self.convert_btn.grid(row=0, column=0, padx=(0, 16))
+
+        bar_col = ctk.CTkFrame(footer, fg_color="transparent")
+        bar_col.grid(row=0, column=1, sticky="ew")
+        bar_col.grid_columnconfigure(0, weight=1)
+
+        self.progress = ctk.CTkProgressBar(bar_col, height=12)
+        self.progress.set(0)
+        self.progress.grid(row=0, column=0, sticky="ew")
+
+        self.status_var = tk.StringVar(value="Ready.")
+        ctk.CTkLabel(
+            bar_col, textvariable=self.status_var,
+            font=ctk.CTkFont(size=12),
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+    # ----- Settings persistence -----
+    def _restore_settings_to_widgets(self) -> None:
+        s = self.settings
+        fmt = s.get("format")
+        if isinstance(fmt, str) and fmt.upper() in FORMATS:
+            self.format_var.set(fmt.upper())
+        q = s.get("quality")
+        if isinstance(q, int) and 1 <= q <= 100:
+            self.quality_var.set(q)
+        if isinstance(s.get("max_dimension"), int):
+            self.resize_entry.configure(state="normal")
+            self.resize_entry.delete(0, "end")
+            self.resize_entry.insert(0, str(s["max_dimension"]))
+            self.resize_entry.configure(state="disabled")
+        if isinstance(s.get("target_kb"), int):
+            self.target_entry.configure(state="normal")
+            self.target_entry.delete(0, "end")
+            self.target_entry.insert(0, str(s["target_kb"]))
+            self.target_entry.configure(state="disabled")
+        for key, var in (
+            ("resize_on", self.resize_on),
+            ("target_on", self.target_on),
+            ("png_optimize", self.png_optimize_var),
+            ("webp_lossless", self.webp_lossless_var),
+        ):
+            if isinstance(s.get(key), bool):
+                var.set(s[key])
+        out = s.get("output_folder")
+        if isinstance(out, str) and out:
+            self.output_var.set(out)
+        self._on_format_change()
+        self._on_toggle_resize()
+        self._on_toggle_target()
+        self._update_quality_label()
+
+    def _gather_settings_snapshot(self) -> dict[str, Any]:
+        out = self.output_var.get().strip()
+        try:
+            max_dim = int(self.resize_entry.get().strip())
+        except ValueError:
+            max_dim = None
+        try:
+            target_kb = int(self.target_entry.get().strip())
+        except ValueError:
+            target_kb = None
+        return {
+            "format": self.format_var.get(),
+            "quality": int(self.quality_var.get()),
+            "max_dimension": max_dim,
+            "target_kb": target_kb,
+            "resize_on": bool(self.resize_on.get()),
+            "target_on": bool(self.target_on.get()),
+            "png_optimize": bool(self.png_optimize_var.get()),
+            "webp_lossless": bool(self.webp_lossless_var.get()),
+            "output_folder": "" if out.startswith("(") else out,
+        }
+
+    def _save_settings(self) -> None:
+        try:
+            data = self._gather_settings_snapshot()
+            self.settings.update(data)
+            user_settings.save(self.settings)
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        self.destroy()
+
+    # ----- Small helpers -----
     def _on_format_change(self) -> None:
         fmt = self.format_var.get()
-        if fmt in LOSSY_FORMATS:
-            self._set_widget_state(self.quality_slider, "normal")
-        else:
-            self._set_widget_state(self.quality_slider, "disabled")
+        state = "normal" if fmt in LOSSY_FORMATS else "disabled"
+        try:
+            self.quality_slider.configure(state=state)
+        except Exception:
+            pass
         self._update_quality_label()
 
     def _update_quality_label(self) -> None:
@@ -291,32 +446,58 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
 
     def _on_toggle_resize(self) -> None:
         state = "normal" if self.resize_on.get() else "disabled"
-        self._set_widget_state(self.resize_entry, state)
+        try:
+            self.resize_entry.configure(state=state)
+        except Exception:
+            pass
 
     def _on_toggle_target(self) -> None:
         state = "normal" if self.target_on.get() else "disabled"
-        self._set_widget_state(self.target_entry, state)
+        try:
+            self.target_entry.configure(state=state)
+        except Exception:
+            pass
 
     def _on_add_files(self) -> None:
         types = [
-            ("Images", "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.gif *.heic *.heif"),
+            ("Images",
+             "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.gif *.heic *.heif"),
             ("All files", "*.*"),
         ]
-        paths = filedialog.askopenfilenames(title="Select images", filetypes=types)
+        initial = self.settings.get("last_input_folder") or ""
+        kwargs = {"title": "Select images", "filetypes": types}
+        if initial and Path(initial).is_dir():
+            kwargs["initialdir"] = initial
+        paths = filedialog.askopenfilenames(**kwargs)
         if paths:
+            self.settings["last_input_folder"] = str(Path(paths[0]).parent)
+            user_settings.save(self.settings)
             self._add_paths([Path(p) for p in paths])
 
     def _on_clear_list(self) -> None:
         self.files.clear()
+        self._ctk_image_cache.clear()
         self._render_list()
 
     def _on_browse_output(self) -> None:
-        folder = filedialog.askdirectory(title="Choose output folder")
+        current = self.output_var.get().strip()
+        kwargs = {"title": "Choose output folder"}
+        if current and not current.startswith("(") and Path(current).is_dir():
+            kwargs["initialdir"] = current
+        elif self.settings.get("output_folder"):
+            d = self.settings["output_folder"]
+            if Path(d).is_dir():
+                kwargs["initialdir"] = d
+        folder = filedialog.askdirectory(**kwargs)
         if folder:
             self.output_var.set(folder)
+            self.settings["output_folder"] = folder
+            user_settings.save(self.settings)
 
     def _on_reset_output(self) -> None:
-        self.output_var.set("(default: 'converted' next to each file)")
+        self.output_var.set(DEFAULT_OUTPUT_HINT)
+        self.settings["output_folder"] = ""
+        user_settings.save(self.settings)
 
     def _on_drop_paths(self, raw_paths) -> None:
         paths: list[Path] = []
@@ -335,10 +516,10 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         if paths:
             self._add_paths(paths)
 
-    # ----- File list management -----
+    # ----- File list -----
     def _add_paths(self, paths: list[Path]) -> None:
         existing = {str(f.path.resolve()) for f in self.files}
-        added = 0
+        added: list[FileEntry] = []
         skipped = 0
         for p in paths:
             try:
@@ -349,10 +530,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             key = str(resolved)
             if key in existing:
                 continue
-            if not p.is_file():
-                skipped += 1
-                continue
-            if not is_supported(p):
+            if not p.is_file() or not is_supported(p):
                 skipped += 1
                 continue
             try:
@@ -360,53 +538,126 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
             except OSError:
                 skipped += 1
                 continue
-            self.files.append(FileEntry(resolved, size, _format_hint(p)))
+            entry = FileEntry(resolved, size, _format_hint(p))
+            self.files.append(entry)
             existing.add(key)
-            added += 1
+            added.append(entry)
+
         self._render_list()
+        if added:
+            self._enqueue_thumbs(added)
         if added or skipped:
             parts = []
             if added:
-                parts.append(f"{added} added")
+                parts.append(f"{len(added)} added")
             if skipped:
-                parts.append(f"{skipped} skipped (unsupported or unreadable)")
+                parts.append(f"{skipped} skipped")
             self.status_var.set(", ".join(parts) + ".")
 
     def _render_list(self) -> None:
         for child in self.list_frame.winfo_children():
             child.destroy()
         if not self.files:
-            self.empty_label = self._label(
+            self._empty_label = ctk.CTkLabel(
                 self.list_frame,
-                "No files yet. Click \"Add files...\" or drop images here.",
-                muted=True,
+                text="No files yet.\nClick \"Add files…\" or drop images here.",
+                text_color=("gray50", "gray60"),
+                justify="center",
             )
-            self.empty_label.grid(row=0, column=0, padx=20, pady=20)
+            self._empty_label.grid(row=0, column=0, padx=24, pady=40)
             return
         for idx, entry in enumerate(self.files):
-            row = self._frame(self.list_frame)
-            row.grid(row=idx, column=0, sticky="ew", padx=4, pady=2)
-            row.grid_columnconfigure(0, weight=1)
-            entry.frame = row
+            self._render_row(idx, entry)
 
-            name_label = self._label(row, entry.path.name)
-            name_label.grid(row=0, column=0, sticky="w", padx=(4, 8))
+    def _render_row(self, idx: int, entry: FileEntry) -> None:
+        row = ctk.CTkFrame(self.list_frame, corner_radius=8,
+                           fg_color=("gray94", "gray22"))
+        row.grid(row=idx, column=0, sticky="ew", padx=4, pady=3)
+        row.grid_columnconfigure(1, weight=1)
+        entry._row_frame = row
 
-            meta_label = self._label(row, f"{human_size(entry.size)}  •  {entry.format_hint}",
-                                     muted=True)
-            meta_label.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        thumb_img = self._build_ctk_image_for(entry)
+        thumb_lbl = ctk.CTkLabel(row, image=thumb_img, text="")
+        thumb_lbl.grid(row=0, column=0, rowspan=2, padx=(10, 12), pady=10)
+        entry._thumb_widget_ref = thumb_lbl
 
-            remove_btn = self._button(row, "Remove",
-                                      lambda i=idx: self._remove_at(i),
-                                      kind="secondary")
-            remove_btn.grid(row=0, column=2, sticky="e", padx=(0, 4))
+        ctk.CTkLabel(
+            row, text=entry.path.name, anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).grid(row=0, column=1, sticky="ew", pady=(10, 0))
+
+        meta = f"{human_size(entry.size)}  •  {entry.format_hint}"
+        if entry.dimensions:
+            w, h = entry.dimensions
+            meta += f"  •  {w} × {h}"
+        meta_label = ctk.CTkLabel(
+            row, text=meta, anchor="w",
+            text_color=("gray45", "gray65"),
+            font=ctk.CTkFont(size=11),
+        )
+        meta_label.grid(row=1, column=1, sticky="ew", pady=(0, 10))
+        entry._meta_label = meta_label
+
+        ctk.CTkButton(
+            row, text="✕", command=lambda i=idx: self._remove_at(i),
+            width=32, height=32,
+            fg_color="transparent",
+            text_color=("gray35", "gray70"),
+            hover_color=("gray80", "gray30"),
+        ).grid(row=0, column=2, rowspan=2, padx=(8, 10), pady=10)
+
+    def _build_ctk_image_for(self, entry: FileEntry):
+        pil = entry._thumb_pil if isinstance(entry._thumb_pil, Image.Image) \
+            else self._placeholder_pil
+        img = ctk.CTkImage(light_image=pil, dark_image=pil,
+                           size=(THUMB_PX, THUMB_PX))
+        self._ctk_image_cache[id(entry)] = img  # keep reference
+        return img
 
     def _remove_at(self, index: int) -> None:
         if 0 <= index < len(self.files):
-            del self.files[index]
+            entry = self.files.pop(index)
+            self._ctk_image_cache.pop(id(entry), None)
             self._render_list()
 
-    # ----- Conversion driver -----
+    # ----- Thumbnail worker -----
+    def _enqueue_thumbs(self, entries: list[FileEntry]) -> None:
+        for e in entries:
+            self._thumb_queue.put(e)
+        if not self._thumb_thread or not self._thumb_thread.is_alive():
+            self._thumb_thread = threading.Thread(
+                target=self._thumb_worker, daemon=True,
+            )
+            self._thumb_thread.start()
+
+    def _thumb_worker(self) -> None:
+        while True:
+            try:
+                entry = self._thumb_queue.get(timeout=0.3)
+            except queue.Empty:
+                return
+            try:
+                with Image.open(entry.path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    w, h = im.size
+                    entry.dimensions = (w, h)
+                    im.thumbnail((THUMB_PX * 2, THUMB_PX * 2),
+                                 Image.Resampling.LANCZOS)
+                    if im.mode != "RGBA":
+                        im = im.convert("RGBA")
+                    # Center on a square placeholder for consistent layout
+                    square = Image.new("RGBA", (THUMB_PX * 2, THUMB_PX * 2),
+                                       (0, 0, 0, 0))
+                    iw, ih = im.size
+                    ox = (THUMB_PX * 2 - iw) // 2
+                    oy = (THUMB_PX * 2 - ih) // 2
+                    square.paste(im, (ox, oy), im)
+                    entry._thumb_pil = square
+            except Exception:
+                entry._thumb_pil = False  # sentinel for failed
+            self._msg_queue.put(("thumb", id(entry)))
+
+    # ----- Conversion -----
     def _gather_options(self) -> Optional[ConvertOptions]:
         out_format = self.format_var.get()
         quality = max(1, min(100, int(self.quality_var.get() or 85)))
@@ -419,8 +670,10 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                 if max_dim <= 0:
                     raise ValueError
             except ValueError:
-                messagebox.showerror("Invalid resize value",
-                                     "Max dimension must be a positive whole number.")
+                messagebox.showerror(
+                    "Invalid resize value",
+                    "Max dimension must be a positive whole number.",
+                )
                 return None
 
         target_kb: Optional[int] = None
@@ -431,13 +684,16 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                 if target_kb <= 0:
                     raise ValueError
             except ValueError:
-                messagebox.showerror("Invalid target size",
-                                     "Target file size must be a positive whole number of KB.")
+                messagebox.showerror(
+                    "Invalid target size",
+                    "Target file size must be a positive whole number of KB.",
+                )
                 return None
             if out_format not in LOSSY_FORMATS:
                 messagebox.showwarning(
                     "Target size ignored",
-                    f"Target file size only applies to lossy formats (JPG/WebP). It will be ignored for {out_format}.",
+                    f"Target file size only applies to lossy formats (JPG/WebP). "
+                    f"It will be ignored for {out_format}.",
                 )
 
         out_dir: Optional[Path] = None
@@ -445,10 +701,10 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         if raw_out and not raw_out.startswith("("):
             out_dir = Path(raw_out)
 
-        # Warn about JPG/BMP transparency loss
         if out_format in {"JPG", "BMP"}:
             risky = [f.path.name for f in self.files
-                     if f.path.suffix.lower() in {".png", ".webp", ".gif", ".heic", ".heif"}]
+                     if f.path.suffix.lower() in
+                     {".png", ".webp", ".gif", ".heic", ".heif"}]
             if risky:
                 ok = messagebox.askyesno(
                     "Transparency will be flattened",
@@ -477,15 +733,15 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         opts = self._gather_options()
         if opts is None:
             return
+        self._save_settings()
 
-        # Snapshot paths so the worker is independent of UI mutations
         paths = [f.path for f in self.files]
         self._set_progress(0.0)
-        self.status_var.set(f"Converting 0 / {len(paths)}...")
-        self.convert_btn.configure(state="disabled", text="Converting...")
+        self.status_var.set(f"Converting 0 / {len(paths)}…")
+        self.convert_btn.configure(state="disabled", text="Converting…")
 
         self._worker = threading.Thread(
-            target=self._worker_run, args=(paths, opts), daemon=True
+            target=self._worker_run, args=(paths, opts), daemon=True,
         )
         self._worker.start()
 
@@ -495,7 +751,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         for i, p in enumerate(paths, 1):
             try:
                 res = convert_one(p, opts)
-            except Exception as e:  # safety net
+            except Exception as e:
                 res = ConvertResult(p, None, 0, 0, "error", f"Unexpected error: {e}")
             results.append(res)
             self._msg_queue.put(("progress", i, total, res))
@@ -513,25 +769,49 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
                     if res.status == "done":
                         self.status_var.set(f"{i}/{total}: {short} — done")
                     elif res.status == "skipped":
-                        self.status_var.set(f"{i}/{total}: {short} — skipped ({res.message})")
+                        self.status_var.set(
+                            f"{i}/{total}: {short} — skipped ({res.message})"
+                        )
                     else:
-                        self.status_var.set(f"{i}/{total}: {short} — error ({res.message})")
+                        self.status_var.set(
+                            f"{i}/{total}: {short} — error ({res.message})"
+                        )
                 elif kind == "done":
                     _, results = msg
                     self._on_batch_done(results)
+                elif kind == "thumb":
+                    self._update_thumb_for(msg[1])
         except queue.Empty:
             pass
-        self.after(100, self._poll_queue)
+        self.after(80, self._poll_queue)
+
+    def _update_thumb_for(self, entry_id: int) -> None:
+        entry = next((f for f in self.files if id(f) == entry_id), None)
+        if entry is None:
+            return
+        widget = entry._thumb_widget_ref
+        if widget is None or not widget.winfo_exists():
+            return
+        new_img = self._build_ctk_image_for(entry)
+        try:
+            widget.configure(image=new_img)
+        except Exception:
+            return
+        meta_label = entry._meta_label
+        if meta_label is not None and entry.dimensions:
+            w, h = entry.dimensions
+            meta = f"{human_size(entry.size)}  •  {entry.format_hint}  •  {w} × {h}"
+            try:
+                meta_label.configure(text=meta)
+            except Exception:
+                pass
 
     def _set_progress(self, fraction: float) -> None:
         fraction = max(0.0, min(1.0, fraction))
-        if USING_CTK and hasattr(self.progress, "set"):
+        try:
             self.progress.set(fraction)
-        else:
-            try:
-                self.progress["value"] = fraction * 100
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def _on_batch_done(self, results: list[ConvertResult]) -> None:
         self.convert_btn.configure(state="normal", text="Convert")
@@ -544,7 +824,7 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         new_total = sum(r.new_bytes for r in done)
         saved_pct = ((orig_total - new_total) / orig_total * 100) if orig_total else 0.0
 
-        summary_lines = [
+        lines = [
             f"Processed: {total}",
             f"Done: {len(done)}    Skipped: {len(skipped)}    Errored: {len(errored)}",
             "",
@@ -555,23 +835,23 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         if done:
             out_dirs = sorted({str(r.dst.parent) for r in done if r.dst})
             if len(out_dirs) == 1:
-                summary_lines.append("")
-                summary_lines.append(f"Output: {out_dirs[0]}")
+                lines.append("")
+                lines.append(f"Output: {out_dirs[0]}")
 
         problems = []
         for r in skipped + errored:
             problems.append(f"  • {r.src.name}: {r.message}")
         if problems:
-            summary_lines.append("")
-            summary_lines.append("Issues:")
-            summary_lines.extend(problems[:20])
+            lines.append("")
+            lines.append("Issues:")
+            lines.extend(problems[:20])
             if len(problems) > 20:
-                summary_lines.append(f"  ... and {len(problems) - 20} more")
+                lines.append(f"  … and {len(problems) - 20} more")
 
         self.status_var.set(
             f"Done. {len(done)}/{total} converted — saved {saved_pct:.1f}%."
         )
-        messagebox.showinfo("Conversion complete", "\n".join(summary_lines))
+        messagebox.showinfo("Conversion complete", "\n".join(lines))
 
 
 def run() -> None:
