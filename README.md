@@ -32,18 +32,32 @@ python main.py
 
 ## Build the Windows .exe
 
-After installing the requirements above:
+After installing the requirements above, just run:
 
 ```powershell
+.\build.ps1
+```
+
+The resulting executable is at `dist\ImageConverter.exe`. It is a single file
+and does not require Python to be installed on the target machine.
+
+`build.ps1` is a thin wrapper around PyInstaller that also points
+`TCL_LIBRARY` / `TK_LIBRARY` at the base interpreter's Tcl directory. Without
+that, PyInstaller 6.x + Python 3.13 + venv on Windows can decide that
+"tkinter installation is broken" and silently exclude it from the build,
+producing an .exe that fails at startup with `ModuleNotFoundError: tkinter`.
+
+If you prefer to invoke PyInstaller directly, the equivalent command is:
+
+```powershell
+$env:TCL_LIBRARY = "$(python -c 'import sys; print(sys.base_prefix)')\tcl\tcl8.6"
+$env:TK_LIBRARY  = "$(python -c 'import sys; print(sys.base_prefix)')\tcl\tk8.6"
 pyinstaller --noconfirm --clean --onefile --windowed `
   --name "ImageConverter" `
   --collect-all customtkinter `
   --collect-all pillow_heif `
   main.py
 ```
-
-The resulting executable is at `dist\ImageConverter.exe`. It is a single file
-and does not require Python to be installed on the target machine.
 
 ## Project layout
 
