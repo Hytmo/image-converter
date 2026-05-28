@@ -1,0 +1,5 @@
+Pillow>=10.0.0
+customtkinter>=5.2.0
+pillow-heif>=0.18.0
+windnd>=1.0.7
+pyinstaller>=6.3.0
