@@ -124,6 +124,8 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self._restore_settings_to_widgets()
         self._poll_queue()
 
+        self.report_callback_exception = self._on_tk_callback_exception
+
         if DND_AVAILABLE:
             try:
                 windnd.hook_dropfiles(self, func=self._on_drop_paths)
@@ -465,6 +467,32 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         self._save_settings()
         self.destroy()
 
+    # ----- Exception handling -----
+    def _on_tk_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        """Catch-all for exceptions raised inside Tk callbacks.
+
+        Tk's default behaviour is to print the traceback to stderr — invisible
+        in a `--windowed` PyInstaller bundle — and continue. We log to a file
+        and surface it in the status bar so the user has a breadcrumb instead
+        of a silent-but-broken window.
+        """
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            log_dir = user_settings.settings_path().parent
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with (log_dir / "error.log").open("a", encoding="utf-8") as f:
+                import datetime
+                f.write(f"\n--- {datetime.datetime.now().isoformat()} ---\n")
+                f.write(tb_text)
+        except Exception:
+            pass
+        try:
+            self.status_var.set(
+                f"Something went wrong: {exc_value}. See error.log in app data."
+            )
+        except Exception:
+            pass
+
     # ----- Small helpers -----
     def _on_format_change(self) -> None:
         fmt = self.format_var.get()
@@ -636,21 +664,54 @@ class App(ctk.CTk if USING_CTK else tk.Tk):
         user_settings.save(self.settings)
 
     def _on_drop_paths(self, raw_paths) -> None:
+        """windnd callback. Runs INSIDE the Win32 windproc dispatch, so we
+        must not synchronously mutate widgets from here — defer to the next
+        Tk event-loop tick instead.
+        """
+        try:
+            # Copy raw input out of the windnd buffer immediately
+            snapshot = list(raw_paths)
+        except Exception:
+            return
+        try:
+            self.after(0, lambda r=snapshot: self._process_dropped_paths(r))
+        except Exception:
+            pass
+
+    def _process_dropped_paths(self, raw_paths) -> None:
         paths: list[Path] = []
-        for raw in raw_paths:
+        try:
+            for raw in raw_paths:
+                try:
+                    if isinstance(raw, bytes):
+                        try:
+                            p = raw.decode("mbcs")
+                        except UnicodeDecodeError:
+                            p = raw.decode("utf-8", errors="replace")
+                    else:
+                        p = str(raw)
+                    path = Path(p)
+                except Exception:
+                    continue
+                try:
+                    if path.is_dir():
+                        for child in path.rglob("*"):
+                            try:
+                                if child.is_file() and is_supported(child):
+                                    paths.append(child)
+                            except OSError:
+                                continue
+                    elif path.is_file():
+                        paths.append(path)
+                except OSError:
+                    continue
+            if paths:
+                self._add_paths(paths)
+        except Exception as exc:
             try:
-                p = raw.decode("mbcs") if isinstance(raw, bytes) else str(raw)
-            except UnicodeDecodeError:
-                p = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            path = Path(p)
-            if path.is_dir():
-                for child in path.rglob("*"):
-                    if child.is_file() and is_supported(child):
-                        paths.append(child)
-            elif path.is_file():
-                paths.append(path)
-        if paths:
-            self._add_paths(paths)
+                self.status_var.set(f"Drop failed: {exc}")
+            except Exception:
+                pass
 
     # ----- File list -----
     def _add_paths(self, paths: list[Path]) -> None:
