@@ -61,6 +61,21 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   main.py
 ```
 
+## Build a Windows installer
+
+After producing `dist\ImageConverter.exe`, you can wrap it in a proper
+Windows installer (with Program Files install, Start Menu + Desktop
+shortcuts, and "Add or remove programs" uninstaller) using
+[Inno Setup](https://jrsoftware.org/isdl.php):
+
+```powershell
+winget install JRSoftware.InnoSetup
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer.iss
+```
+
+The signed-and-compressed setup file is written to
+`installer_output\ImageConverter-Setup.exe`.
+
 ## Settings
 
 User preferences (last output folder, format, quality, toggles) are saved to
